@@ -1,271 +1,492 @@
-/* GPU-Diamond: standalone CUDA implementation of seed-and-extend
- * protein alignment, inspired by GPU-BLAST and Diamond.
- *
- * Layout:
- *   db_padded[seq_idx * padded_len + offset]   (row-major, 1 byte / AA)
- *   matrix[q*28 + s]                            (BLOSUM62 row-major)
- *   bucket_count[hash]                          (#query positions for hash)
- *   bucket_pos[hash * MAX_HITS_BUCKET + i]      (i-th query position)
- *
- * Each CUDA thread processes one or more subject sequences (strided by
- * grid*block size), scans every 4-mer, looks up query hits, performs
- * ungapped extension with X-dropoff, and stores HSPs in DiamondResult.
- */
-
+/* gpu_diamond_v2.cu - CUDA implementation with gapped extension */
 #include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stdint.h>
+#include <float.h>
 
-#include "gpu_diamond.h"
+#define DIAMOND_ALPHABET_SIZE   28
+#define DIAMOND_MAX_SEED_WEIGHT 10
+#define DIAMOND_MAX_SEED_LENGTH 32
+#define DIAMOND_MAX_HITS_BUCKET 32
+#define DIAMOND_MAX_HSPS        32
+#define DIAMOND_DIAG_SIZE       256
+#define DIAMOND_DIAG_MASK       255
+#define DIAMOND_MAX_QUERY_LEN   8192
+#define MAX_BAND_WIDTH          64  /* For banded SW */
 
-/* ---------- Device constants ---------- */
-__constant__ signed char d_matrix[DIAMOND_ALPHABET_SIZE * DIAMOND_ALPHABET_SIZE];
+/* Error checking macro */
+#define CUDA_CHECK(err) do { \
+    cudaError_t e = (err); \
+    if (e != cudaSuccess) { \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, \
+                cudaGetErrorString(e)); \
+        return e; \
+    } \
+} while(0)
+
+/* ============================================================
+ * Device constants (set via cudaMemcpyToSymbol)
+ * ============================================================ */
+__constant__ signed char d_matrix[28*28];
 __constant__ unsigned char d_query[DIAMOND_MAX_QUERY_LEN];
 __constant__ int d_qlen;
-__constant__ int d_xdrop;
+__constant__ int d_xdrop_ungapped;
+__constant__ int d_xdrop_gapped;
 __constant__ int d_min_score;
 __constant__ int d_seed_score_min;
+__constant__ int d_gap_open;
+__constant__ int d_gap_extend;
+__constant__ int d_band_width;
+__constant__ int d_gap_mode;  /* 0=none, 1=banded_fast, 2=banded_slow */
 
-/* ---------- Device helpers ---------- */
-__device__ __forceinline__ uint32_t d_hash4(const unsigned char* s)
+/* ============================================================
+ * Device structures
+ * ============================================================ */
+struct SeedShape {
+    int  weight;
+    int  length;
+    int  positions[DIAMOND_MAX_SEED_WEIGHT];
+    unsigned int mask;
+};
+
+__constant__ SeedShape d_seed_shape;
+
+struct DiamondHSP {
+    /* Ungapped coordinates */
+    int q_start, q_end;
+    int s_start, s_end;
+    int ungapped_score;
+    
+    /* Gapped coordinates */
+    int gapped_q_start, gapped_q_end;
+    int gapped_s_start, gapped_s_end;
+    int gapped_score;
+    
+    int diagonal;  /* q_start - s_start */
+};
+
+/* ============================================================
+ * Device helper: Hash with spaced seed
+ * ============================================================ */
+__device__ uint64_t d_hash_seed_spaced(const unsigned char* seq, const SeedShape* shape)
 {
-    return ((uint32_t)s[0] * (28u * 28u * 28u))
-         + ((uint32_t)s[1] * (28u * 28u))
-         + ((uint32_t)s[2] * 28u)
-         + ((uint32_t)s[3]);
+    uint64_t hash = 0;
+    for (int i = 0; i < shape->weight; i++) {
+        hash *= DIAMOND_ALPHABET_SIZE;
+        hash += seq[shape->positions[i]];
+    }
+    return hash;
 }
 
-/* Score a 4-mer match using BLOSUM62 */
-__device__ __forceinline__ int d_seed_score(const unsigned char* subj,
-                                            int q_off)
+/* ============================================================
+ * Device helper: Score seed
+ * ============================================================ */
+__device__ int d_score_seed(const unsigned char* query, int qpos,
+                            const unsigned char* subject, int spos,
+                            int seed_len)
 {
     int sc = 0;
-    #pragma unroll
-    for (int i = 0; i < DIAMOND_SEED_SIZE; ++i) {
-        unsigned char q = d_query[q_off + i];
-        unsigned char s = subj[i];
-        sc += d_matrix[q * DIAMOND_ALPHABET_SIZE + s];
+    for (int k = 0; k < seed_len; k++) {
+        unsigned char qc = query[qpos + k];
+        unsigned char sc_ = subject[spos + k];
+        sc += d_matrix[qc * DIAMOND_ALPHABET_SIZE + sc_];
     }
     return sc;
 }
 
-/* Ungapped extension: extend left and right from (s_off, q_off).
- * Returns max score and bounds. */
-struct ExtResult { int score, q_lo, q_hi, s_lo, s_hi; };
-
-__device__ ExtResult d_ungapped_extend(const unsigned char* subj, int slen,
-                                       int s_off, int q_off,
-                                       int x_drop)
+/* ============================================================
+ * Device function: Ungapped X-drop extension
+ * ============================================================ */
+__device__ void d_ungapped_extend(const unsigned char* query, int qlen, int q_anchor,
+                                   const unsigned char* subject, int slen, int s_anchor,
+                                   int* left_score, int* left_qpos, int* left_spos,
+                                   int* right_score, int* right_qpos, int* right_spos,
+                                   int* total_score)
 {
-    /* The 4-mer match itself */
-    int seed = d_seed_score(subj + s_off, q_off);
-
-    /* Extend right (after the seed) */
-    int score      = seed;
-    int max_score  = seed;
-    int max_dr     = DIAMOND_SEED_SIZE - 1;   /* index of last accepted position */
-    int s = s_off + DIAMOND_SEED_SIZE;
-    int q = q_off + DIAMOND_SEED_SIZE;
-    int dr = DIAMOND_SEED_SIZE;
-    while (s < slen && q < d_qlen) {
-        score += d_matrix[d_query[q] * DIAMOND_ALPHABET_SIZE + subj[s]];
-        if (score > max_score) { max_score = score; max_dr = dr; }
-        else if (max_score - score > x_drop) break;
-        ++s; ++q; ++dr;
+    const int xdrop = d_xdrop_ungapped;
+    int best = 0, st = 0, n = 1;
+    int delta = 0;
+    
+    /* Extend left */
+    int q = q_anchor - 1;
+    int s = s_anchor - 1;
+    
+    while (best - st < xdrop && q >= 0 && s >= 0 && s < slen) {
+        st += d_matrix[d_query[q] * DIAMOND_ALPHABET_SIZE + subject[s]];
+        if (st > best) {
+            best = st;
+            delta = n;
+        }
+        q--; s--; n++;
     }
-
-    /* Extend left (before the seed) starting from the right-extended max */
-    int left_score = 0;
-    int max_left   = 0;
-    int max_dl     = 0;
-    int sl = s_off - 1;
-    int ql = q_off - 1;
-    int dl = 1;
-    while (sl >= 0 && ql >= 0) {
-        left_score += d_matrix[d_query[ql] * DIAMOND_ALPHABET_SIZE + subj[sl]];
-        if (left_score > max_left) { max_left = left_score; max_dl = dl; }
-        else if (max_left - left_score > x_drop) break;
-        --sl; --ql; ++dl;
+    *left_score = best;
+    *left_qpos = q_anchor - delta;
+    *left_spos = s_anchor - delta;
+    
+    /* Extend right */
+    best = 0; st = 0; n = 1;
+    int len_right = 0;
+    q = q_anchor;
+    s = s_anchor;
+    
+    while (best - st < xdrop && q < qlen && s >= 0 && s < slen) {
+        st += d_matrix[d_query[q] * DIAMOND_ALPHABET_SIZE + subject[s]];
+        if (st > best) {
+            best = st;
+            len_right = n;
+        }
+        q++; s++; n++;
     }
-
-    ExtResult r;
-    r.score = max_score + max_left;
-    r.q_lo  = q_off - max_dl;
-    r.q_hi  = q_off + max_dr;     /* inclusive end */
-    r.s_lo  = s_off - max_dl;
-    r.s_hi  = s_off + max_dr;
-    return r;
+    *right_score = best;
+    *right_qpos = q_anchor + len_right - 1;
+    *right_spos = s_anchor + len_right - 1;
+    
+    /* Total (seed_score + left + right, seed counted once) */
+    int seed_score = d_matrix[d_query[q_anchor] * DIAMOND_ALPHABET_SIZE + subject[s_anchor]];
+    *total_score = *left_score + seed_score + *right_score;
 }
 
-/* ---------- Main kernel ---------- */
-__global__ void diamond_kernel(const unsigned char* __restrict__ db_padded,
-                               const int*           __restrict__ seq_lengths,
-                               int                  num_sequences,
-                               int                  padded_len,
-                               const uint32_t*      __restrict__ bucket_count,
-                               const uint32_t*      __restrict__ bucket_pos,
-                               DiamondResult*       __restrict__ results)
+/* ============================================================
+ * Device function: Banded Smith-Waterman (simplified)
+ * Uses diagonal banding with reduced memory footprint
+ * ============================================================ */
+__device__ int d_banded_sw(const unsigned char* query, int q_start, int q_len,
+                            const unsigned char* subject, int s_start, int s_len,
+                            int band_width,
+                            int* out_q_start, int* out_q_end,
+                            int* out_s_start, int* out_s_end,
+                            int xdrop)
 {
-    int tid    = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = gridDim.x * blockDim.x;
+    /* Simplified banded SW - compute within band around diagonal */
+    const int gap_open = d_gap_open;
+    const int gap_extend = d_gap_extend;
+    
+    int mid_diag = q_start - s_start;
+    int half_band = band_width / 2;
+    
+    int max_score = 0;
+    int max_q = q_start, max_s = s_start;
+    
+    int i = q_start, j = s_start;
+    int local_score = 0;
+    int gap_len = 0;
+    
+    /* Simple greedy extension within band */
+    while (i < q_len && j < s_len && i >= 0 && j >= 0) {
+        int diag = i - j;
+        if (abs(diag - mid_diag) > half_band) break;
+        
+        int match = d_matrix[d_query[i] * DIAMOND_ALPHABET_SIZE + subject[j]];
+        
+        if (match > 0) {
+            /* Match/mismatch */
+            local_score += match;
+            gap_len = 0;
+        } else {
+            /* Consider gap */
+            int gap_penalty = gap_open + gap_len * gap_extend;
+            if (match > -gap_penalty) {
+                local_score += match;
+                gap_len = 0;
+            } else {
+                local_score -= gap_penalty;
+                gap_len++;
+            }
+        }
+        
+        /* X-drop check */
+        if (local_score > max_score) {
+            max_score = local_score;
+            max_q = i;
+            max_s = j;
+        }
+        
+        if (max_score - local_score > xdrop) break;
+        
+        i++; j++;
+    }
+    
+    *out_q_end = max_q;
+    *out_s_end = max_s;
+    *out_q_start = q_start;
+    *out_s_start = s_start;
+    
+    return max_score;
+}
 
-    /* Per-thread diagonal table (in registers/local memory).
-     * Stores last subject offset extended for diagonal d (mod DIAMOND_DIAG_SIZE).
-     * Init to -DIAMOND_SEED_SIZE so any first hit is accepted. */
-    int diag_last[DIAMOND_DIAG_SIZE];
-    #pragma unroll 1
-    for (int i = 0; i < DIAMOND_DIAG_SIZE; ++i) diag_last[i] = -DIAMOND_SEED_SIZE;
-
-    for (int seq = tid; seq < num_sequences; seq += stride) {
-        const unsigned char* subj = db_padded + (size_t)seq * padded_len;
+/* ============================================================
+ * Main kernel
+ * ============================================================ */
+__global__ void diamond_kernel(const unsigned char* db_padded,
+                                const int* seq_lengths,
+                                const uint32_t* bucket_count,
+                                const uint32_t* bucket_pos,
+                                uint64_t hash_space,
+                                int num_seqs,
+                                int padded_length,
+                                DiamondHSP* results,
+                                int* result_counts,
+                                int max_hsps_per_seq)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = gridDim.x * blockDim.x;
+    
+    /* Per-thread diagonal table for dedup */
+    unsigned short diag_table[DIAMOND_DIAG_SIZE];
+    
+    /* Process sequences in strided fashion */
+    for (int seq = tid; seq < num_seqs; seq += total_threads) {
         int slen = seq_lengths[seq];
-
-        DiamondResult res;
-        res.num_hsps = 0;
-        res.total_score = 0;
-        res.seed_hits = 0;
-        res.extensions = 0;
-
-        /* Reset diag table for this sequence */
-        for (int i = 0; i < DIAMOND_DIAG_SIZE; ++i) diag_last[i] = -DIAMOND_SEED_SIZE;
-
-        if (slen >= DIAMOND_SEED_SIZE) {
-            for (int s_off = 0; s_off + DIAMOND_SEED_SIZE <= slen; ++s_off) {
-                uint32_t h = d_hash4(subj + s_off);
-                uint32_t cnt = bucket_count[h];
-                if (cnt == 0) continue;
-
-                if (cnt > DIAMOND_MAX_HITS_BUCKET) cnt = DIAMOND_MAX_HITS_BUCKET;
-                res.seed_hits += (int)cnt;
-
-                for (uint32_t k = 0; k < cnt; ++k) {
-                    int q_off = (int)bucket_pos[h * DIAMOND_MAX_HITS_BUCKET + k];
-
-                    /* Diagonal de-dup */
-                    int diag = (q_off - s_off) & DIAMOND_DIAG_MASK;
-                    if (s_off - diag_last[diag] < DIAMOND_SEED_SIZE) continue;
-
-                    int sscore = d_seed_score(subj + s_off, q_off);
-                    if (sscore < d_seed_score_min) continue;
-
-                    res.extensions++;
-
-                    ExtResult e = d_ungapped_extend(subj, slen, s_off, q_off, d_xdrop);
-                    diag_last[diag] = e.s_hi;
-
-                    if (e.score >= d_min_score && res.num_hsps < DIAMOND_MAX_HSPS) {
-                        DiamondHSP* hsp = &res.hsps[res.num_hsps++];
-                        hsp->q_start = e.q_lo;
-                        hsp->q_end   = e.q_hi;
-                        hsp->s_start = e.s_lo;
-                        hsp->s_end   = e.s_hi;
-                        hsp->score   = e.score;
-                        res.total_score += e.score;
+        if (slen <= 0) continue;
+        
+        const unsigned char* subject = db_padded + (size_t)seq * padded_length;
+        
+        /* Clear diagonal table */
+        for (int i = 0; i < DIAMOND_DIAG_SIZE; i++) diag_table[i] = 0;
+        
+        /* Clear result slots for this sequence */
+        DiamondHSP* my_results = results + (size_t)seq * max_hsps_per_seq;
+        int hsp_count = 0;
+        int seed_hits = 0;
+        int extensions = 0;
+        
+        int seed_len = d_seed_shape.length > 0 ? d_seed_shape.length : 4;
+        
+        /* Scan subject for seeds */
+        for (int s_pos = 0; s_pos <= slen - seed_len; s_pos++) {
+            /* Check for invalid characters (mask) */
+            int valid = 1;
+            for (int k = 0; k < seed_len && valid; k++) {
+                if (subject[s_pos + k] >= 27) valid = 0;
+            }
+            if (!valid) continue;
+            
+            /* Hash seed at this position */
+            uint64_t h;
+            if (d_seed_shape.weight > 0) {
+                h = d_hash_seed_spaced(subject + s_pos, &d_seed_shape);
+            } else {
+                /* Fallback contiguous hash */
+                h = ((uint64_t)subject[s_pos] * 28 * 28 * 28)
+                  + ((uint64_t)subject[s_pos+1] * 28 * 28)
+                  + ((uint64_t)subject[s_pos+2] * 28)
+                  + (uint64_t)subject[s_pos+3];
+            }
+            
+            if (h >= hash_space) continue;
+            
+            uint32_t count = bucket_count[h];
+            if (count == 0) continue;
+            if (count > DIAMOND_MAX_HITS_BUCKET) count = DIAMOND_MAX_HITS_BUCKET;
+            
+            uint32_t base = bucket_pos[h];
+            seed_hits += count;
+            
+            /* Try each query hit position */
+            for (uint32_t i = 0; i < count; i++) {
+                int q_pos = bucket_pos[base + i];
+                
+                /* Check seed score threshold */
+                int seed_sc = d_score_seed(d_query, q_pos, subject, s_pos, seed_len);
+                if (seed_sc < d_seed_score_min) continue;
+                
+                /* Diagonal check for dedup */
+                int diag = q_pos - s_pos;
+                int diag_idx = diag & DIAMOND_DIAG_MASK;
+                unsigned short diag_val = (unsigned short)((diag >> 8) & 0xFFFF);
+                
+                if (diag_table[diag_idx] == diag_val) continue;
+                diag_table[diag_idx] = diag_val;
+                
+                extensions++;
+                
+                /* Ungapped extension */
+                int left_sc, right_sc, total_sc;
+                int left_q, left_s, right_q, right_s;
+                
+                d_ungapped_extend(d_query, d_qlen, q_pos,
+                                  subject, slen, s_pos,
+                                  &left_sc, &left_q, &left_s,
+                                  &right_sc, &right_q, &right_s,
+                                  &total_sc);
+                
+                if (total_sc < d_min_score) continue;
+                
+                /* Store as HSP */
+                if (hsp_count < max_hsps_per_seq) {
+                    DiamondHSP* h = &my_results[hsp_count];
+                    h->q_start = left_q;
+                    h->q_end = right_q;
+                    h->s_start = left_s;
+                    h->s_end = right_s;
+                    h->ungapped_score = total_sc;
+                    h->diagonal = diag;
+                    
+                    /* Gapped extension if enabled */
+                    if (d_gap_mode > 0 && d_band_width > 0) {
+                        h->gapped_score = d_banded_sw(
+                            d_query, left_q, d_qlen,
+                            subject, left_s, slen,
+                            d_band_width,
+                            &h->gapped_q_start, &h->gapped_q_end,
+                            &h->gapped_s_start, &h->gapped_s_end,
+                            d_xdrop_gapped
+                        );
+                        if (h->gapped_score < h->ungapped_score) {
+                            /* Gapped didn't improve - use ungapped */
+                            h->gapped_score = 0;
+                        }
+                    } else {
+                        h->gapped_score = 0;
                     }
+                    
+                    hsp_count++;
                 }
             }
         }
-
-        results[seq] = res;
+        
+        result_counts[seq] = hsp_count;
     }
 }
 
-/* ---------- Host launcher ---------- */
-#define CUDA_CHECK(call) do {                                          \
-    cudaError_t _e = (call);                                           \
-    if (_e != cudaSuccess) {                                           \
-        fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #call,         \
-                __FILE__, __LINE__, cudaGetErrorString(_e));           \
-        return (int)_e;                                                \
-    }                                                                  \
-} while (0)
+/* ============================================================
+ * Host launcher
+ * ============================================================ */
 
-extern "C"
-int diamond_gpu_search(const unsigned char* query, int qlen,
-                       const unsigned char* db_padded,
-                       const int*           seq_lengths,
-                       const DiamondGPUOptions* opts,
-                       DiamondResult*       results)
+extern "C" {
+
+typedef struct {
+    int q_start, q_end, s_start, s_end, ungapped_score;
+    int gapped_q_start, gapped_q_end, gapped_s_start, gapped_s_end, gapped_score;
+    int diagonal;
+} DiamondHSP_Device;
+
+typedef struct {
+    int weight;
+    int length;
+    int positions[DIAMOND_MAX_SEED_WEIGHT];
+    unsigned int mask;
+} SeedShape_Host;
+
+int diamond_gpu_search_v2(const unsigned char* query, int qlen,
+                          const unsigned char* db_padded,
+                          const int* seq_lengths,
+                          int num_sequences,
+                          int padded_length,
+                          const uint32_t* bucket_count,
+                          const uint32_t* bucket_pos,
+                          uint64_t hash_space,
+                          const signed char* blosum62,
+                          const SeedShape_Host* seed_shape,
+                          int xdrop_ungapped,
+                          int xdrop_gapped,
+                          int min_score,
+                          int seed_score_min,
+                          int gap_open,
+                          int gap_extend,
+                          int band_width,
+                          int gap_mode,
+                          int num_blocks,
+                          int num_threads,
+                          DiamondHSP_Device* results,
+                          int* result_counts,
+                          int max_hsps_per_seq)
 {
-    if (qlen <= 0 || qlen > DIAMOND_MAX_QUERY_LEN) {
-        fprintf(stderr, "Query length %d out of range [1, %d]\n",
-                qlen, DIAMOND_MAX_QUERY_LEN);
-        return -1;
+    /* Copy BLOSUM62 to constant memory */
+    CUDA_CHECK(cudaMemcpyToSymbol(d_matrix, blosum62, 28*28));
+    
+    /* Copy query to constant memory */
+    if (qlen > DIAMOND_MAX_QUERY_LEN) qlen = DIAMOND_MAX_QUERY_LEN;
+    CUDA_CHECK(cudaMemcpyToSymbol(d_query, query, qlen));
+    int zero = 0;
+    CUDA_CHECK(cudaMemcpyToSymbol(d_query + qlen, &zero, 1));
+    
+    /* Copy scalar params */
+    CUDA_CHECK(cudaMemcpyToSymbol(d_qlen, &qlen, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_xdrop_ungapped, &xdrop_ungapped, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_xdrop_gapped, &xdrop_gapped, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_min_score, &min_score, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_seed_score_min, &seed_score_min, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_gap_open, &gap_open, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_gap_extend, &gap_extend, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_band_width, &band_width, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_gap_mode, &gap_mode, sizeof(int)));
+    
+    /* Copy seed shape */
+    if (seed_shape) {
+        SeedShape dev_shape;
+        dev_shape.weight = seed_shape->weight;
+        dev_shape.length = seed_shape->length;
+        dev_shape.mask = seed_shape->mask;
+        for (int i = 0; i < DIAMOND_MAX_SEED_WEIGHT; i++) {
+            dev_shape.positions[i] = seed_shape->positions[i];
+        }
+        CUDA_CHECK(cudaMemcpyToSymbol(d_seed_shape, &dev_shape, sizeof(SeedShape)));
     }
-    if (opts->num_sequences <= 0) return 0;
-
-    /* ----- Build host-side lookup table ----- */
-    uint32_t* h_bucket_count = (uint32_t*)calloc(DIAMOND_HASH_SIZE, sizeof(uint32_t));
-    uint32_t* h_bucket_pos   = (uint32_t*)calloc((size_t)DIAMOND_HASH_SIZE * DIAMOND_MAX_HITS_BUCKET, sizeof(uint32_t));
-    if (!h_bucket_count || !h_bucket_pos) {
-        fprintf(stderr, "Out of host memory for lookup table\n");
-        free(h_bucket_count); free(h_bucket_pos);
-        return -2;
-    }
-    diamond_build_lookup(query, qlen, h_bucket_count, h_bucket_pos);
-
-    /* ----- BLOSUM62 to constant memory ----- */
-    signed char h_matrix[DIAMOND_ALPHABET_SIZE * DIAMOND_ALPHABET_SIZE];
-    diamond_fill_blosum62(h_matrix);
-
-    /* ----- Allocate GPU buffers ----- */
+    
+    /* Allocate device memory for database */
     unsigned char* d_db = NULL;
-    int*           d_lens = NULL;
-    uint32_t*      d_bcount = NULL;
-    uint32_t*      d_bpos = NULL;
-    DiamondResult* d_results = NULL;
-
-    size_t db_bytes      = (size_t)opts->num_sequences * opts->padded_length;
-    size_t lens_bytes    = (size_t)opts->num_sequences * sizeof(int);
-    size_t bcount_bytes  = (size_t)DIAMOND_HASH_SIZE * sizeof(uint32_t);
-    size_t bpos_bytes    = (size_t)DIAMOND_HASH_SIZE * DIAMOND_MAX_HITS_BUCKET * sizeof(uint32_t);
-    size_t results_bytes = (size_t)opts->num_sequences * sizeof(DiamondResult);
-
-    CUDA_CHECK(cudaMalloc(&d_db,      db_bytes));
-    CUDA_CHECK(cudaMalloc(&d_lens,    lens_bytes));
-    CUDA_CHECK(cudaMalloc(&d_bcount,  bcount_bytes));
-    CUDA_CHECK(cudaMalloc(&d_bpos,    bpos_bytes));
-    CUDA_CHECK(cudaMalloc(&d_results, results_bytes));
-
-    CUDA_CHECK(cudaMemcpy(d_db,     db_padded,      db_bytes,     cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_lens,   seq_lengths,    lens_bytes,   cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_bcount, h_bucket_count, bcount_bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_bpos,   h_bucket_pos,   bpos_bytes,   cudaMemcpyHostToDevice));
-
-    /* Copy constants */
-    CUDA_CHECK(cudaMemcpyToSymbol(d_matrix, h_matrix, sizeof(h_matrix)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_query,  query,    (size_t)qlen));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_qlen,           &qlen,                sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_xdrop,          &opts->x_drop,        sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_min_score,      &opts->min_score,     sizeof(int)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_seed_score_min, &opts->seed_score_min,sizeof(int)));
-
-    /* ----- Launch kernel ----- */
-    dim3 grid(opts->num_blocks);
-    dim3 block(opts->num_threads);
-    diamond_kernel<<<grid, block>>>(d_db, d_lens, opts->num_sequences,
-                                    opts->padded_length,
-                                    d_bcount, d_bpos, d_results);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(err));
-        free(h_bucket_count); free(h_bucket_pos);
-        cudaFree(d_db); cudaFree(d_lens); cudaFree(d_bcount); cudaFree(d_bpos); cudaFree(d_results);
-        return (int)err;
-    }
+    int* d_seq_lens = NULL;
+    size_t db_size = (size_t)num_sequences * padded_length;
+    
+    CUDA_CHECK(cudaMalloc(&d_db, db_size));
+    CUDA_CHECK(cudaMalloc(&d_seq_lens, num_sequences * sizeof(int)));
+    
+    CUDA_CHECK(cudaMemcpy(d_db, db_padded, db_size, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_seq_lens, seq_lengths, num_sequences * sizeof(int), 
+                          cudaMemcpyHostToDevice));
+    
+    /* Allocate device memory for lookup tables */
+    uint32_t* d_bucket_count = NULL;
+    uint32_t* d_bucket_pos = NULL;
+    
+    CUDA_CHECK(cudaMalloc(&d_bucket_count, hash_space * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_bucket_pos, hash_space * DIAMOND_MAX_HITS_BUCKET * sizeof(uint32_t)));
+    
+    CUDA_CHECK(cudaMemcpy(d_bucket_count, bucket_count, hash_space * sizeof(uint32_t),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_bucket_pos, bucket_pos, 
+                          hash_space * DIAMOND_MAX_HITS_BUCKET * sizeof(uint32_t),
+                          cudaMemcpyHostToDevice));
+    
+    /* Allocate results */
+    DiamondHSP_Device* d_results = NULL;
+    int* d_result_counts = NULL;
+    
+    CUDA_CHECK(cudaMalloc(&d_results, (size_t)num_sequences * max_hsps_per_seq * 
+                          sizeof(DiamondHSP_Device)));
+    CUDA_CHECK(cudaMalloc(&d_result_counts, num_sequences * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_result_counts, 0, num_sequences * sizeof(int)));
+    
+    /* Launch kernel */
+    diamond_kernel<<<num_blocks, num_threads>>>(
+        d_db, d_seq_lens,
+        d_bucket_count, d_bucket_pos, hash_space,
+        num_sequences, padded_length,
+        (DiamondHSP*)d_results, d_result_counts, max_hsps_per_seq
+    );
+    
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    /* ----- Copy back ----- */
-    CUDA_CHECK(cudaMemcpy(results, d_results, results_bytes, cudaMemcpyDeviceToHost));
-
-    /* ----- Cleanup ----- */
-    free(h_bucket_count);
-    free(h_bucket_pos);
+    
+    /* Copy back results */
+    CUDA_CHECK(cudaMemcpy(results, d_results,
+                          (size_t)num_sequences * max_hsps_per_seq * sizeof(DiamondHSP_Device),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(result_counts, d_result_counts,
+                          num_sequences * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    
+    /* Cleanup */
     cudaFree(d_db);
-    cudaFree(d_lens);
-    cudaFree(d_bcount);
-    cudaFree(d_bpos);
+    cudaFree(d_seq_lens);
+    cudaFree(d_bucket_count);
+    cudaFree(d_bucket_pos);
     cudaFree(d_results);
+    cudaFree(d_result_counts);
+    
     return 0;
 }
+
+} /* extern "C" */
