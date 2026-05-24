@@ -50,7 +50,8 @@ C_SOURCES := \
 
 # CUDA source files
 CU_SOURCES := \
-    $(SEARCH_DIR)/gpu_diamond.cu
+    $(SEARCH_DIR)/gpu_diamond.cu \
+    $(SEARCH_DIR)/gpu_diamond_fast.cu
 
 # Object files
 C_OBJECTS := $(C_SOURCES:.c=.o)
@@ -71,10 +72,18 @@ all: test_gpu_diamond
 libgpudiamond.a: $(C_OBJECTS) $(CU_OBJECTS)
 	ar rcs $@ $^
 
-# Test executable
+# Test executables
+all: test_gpu_diamond test_gpu_diamond_fast
+
 test_gpu_diamond: $(TEST_DIR)/test_gpu_diamond.c libgpudiamond.a
 	$(CC) $(CFLAGS) -c $< -o $(TEST_DIR)/test_gpu_diamond.o
 	$(CXX) -o $@ $(TEST_DIR)/test_gpu_diamond.o -L. -lgpudiamond \
+	       -L$(CUDA_LIB) -lcudart -lm
+
+# UltraFast test (persistent DB, early termination)
+test_gpu_diamond_fast: $(TEST_DIR)/test_gpu_diamond_fast.c libgpudiamond.a
+	$(CC) $(CFLAGS) -c $< -o $(TEST_DIR)/test_gpu_diamond_fast.o
+	$(CXX) -o $@ $(TEST_DIR)/test_gpu_diamond_fast.o -L. -lgpudiamond \
 	       -L$(CUDA_LIB) -lcudart -lm
 
 # CPU-only test (no CUDA linking)
@@ -87,7 +96,7 @@ clean:
 	rm -f $(DATA_DIR)/*.o $(STATS_DIR)/*.o $(MASKING_DIR)/*.o
 	rm -f $(DP_DIR)/*.o $(OUTPUT_DIR)/*.o $(RUN_DIR)/*.o
 	rm -f $(TEST_DIR)/*.o
-	rm -f *.a test_gpu_diamond test_cpu_only
+	rm -f *.a test_gpu_diamond test_gpu_diamond_fast test_cpu_only
 
 .PHONY: all clean test_cpu_only
 
