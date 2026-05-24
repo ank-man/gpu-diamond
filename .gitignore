@@ -1,0 +1,23 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.exe
+test_gpu_diamond
+
+# CUDA compiled objects
+*.cu.o
+*.ptx
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Debug
+*.dSYM/
