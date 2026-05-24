@@ -27,7 +27,25 @@ gpu-diamond/
 │   │   └── gpu_diamond.c   # Host helper functions
 │   ├── search/            # Seed finding and hit detection
 │   │   └── gpu_diamond.cu  # CUDA kernel implementation
-│   ├── align/             # Alignment algorithms (future expansion)
+│   ├── data/              # Sequence and block data structures
+│   │   ├── sequence.h
+│   │   └── sequence.c
+│   ├── stats/             # Karlin-Altschul statistics
+│   │   ├── karlin_altschul.h
+│   │   └── karlin_altschul.c
+│   ├── masking/           # Low-complexity masking
+│   │   ├── seg.h
+│   │   └── seg.c
+│   ├── dp/                # Dynamic programming (ungapped extension)
+│   │   ├── ungapped.h
+│   │   └── ungapped.c
+│   ├── output/            # Output formatters
+│   │   ├── output_format.h
+│   │   └── output_format.c
+│   ├── run/               # Main execution pipeline
+│   │   ├── run.h
+│   │   └── run.c
+│   ├── align/             # Gapped alignment (future expansion)
 │   ├── util/              # Utility functions (future expansion)
 │   └── test/              # Test suite
 │       └── test_gpu_diamond.c
@@ -38,7 +56,13 @@ gpu-diamond/
 |-----------|-------------|
 | `src/basic/` | Core API, types, constants, encoding functions |
 | `src/search/` | CUDA kernels for seed lookup and extension |
-| `src/align/` | Gapped alignment algorithms (future expansion) |
+| `src/data/` | Sequence and block data structures |
+| `src/stats/` | Karlin-Altschul statistics (E-values, bit-scores) |
+| `src/masking/` | SEG-style low-complexity masking |
+| `src/dp/` | Dynamic programming (ungapped extension) |
+| `src/output/` | Output formatters (tabular, SAM, etc.) |
+| `src/run/` | Main execution pipeline |
+| `src/align/` | Gapped alignment (future expansion) |
 | `src/util/` | Utility functions (future expansion) |
 | `src/test/` | Test suite |
 
