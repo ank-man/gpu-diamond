@@ -67,6 +67,52 @@ GPU-Diamond is a CUDA-accelerated implementation of the Diamond protein alignmen
 
 ---
 
+## Performance Reality Check
+
+**Honest assessment: GPU-Diamond is NOT always faster than CPU DIAMOND.** Here's why:
+
+### When GPU-Diamond LOSES to CPU DIAMOND
+
+| Issue | Why It Hurts |
+|-------|--------------|
+| **Workload mismatch** | Many short genome chunks → launch overhead dominates. GPUs need large, uniform work. |
+| **Pipeline maturity** | DIAMOND has years of SIMD/cache/thread tuning. This project is experimental. |
+| **H↔D transfer overhead** | If DB isn't kept resident on GPU, copy cost dominates short queries. |
+| **DNA vs protein input** | Genome FASTA chunks fed into protein scorer → poor seed behavior. Use translated ORFs. |
+| **Small databases** | DIAMOND fits everything in CPU cache. GPU underutilized. |
+
+### When GPU-Diamond WINS
+
+| Scenario | Why GPU Helps |
+|----------|---------------|
+| **Many queries, same DB** | Persistent GPU DB eliminates repeated transfers |
+| **Large protein databases** | GPU parallelism shines with millions of subjects |
+| **Translated protein search** | Clean seed-and-extend workload matches GPU model |
+| **High-similarity matches** | Early termination saves work |
+| **Batch processing** | Amortizes kernel launch overhead |
+
+### Real Benchmark Caveats
+
+If you ran GPU-Diamond vs DIAMOND on **whole-genome FASTA chunks**:
+- This is a **smoke test, not a clean blastp workload**
+- DIAMOND's CPU heuristics handle this fragmentation better
+- Counters like `seed_hits=0` with large `hsps` suggest the fast path may be bypassed
+- **Recommendation:** Use translated proteins/ORFs for fair comparison
+
+### Honest Roadmap to Beat CPU DIAMOND
+
+1. ✅ Persistent GPU database (done)
+2. ✅ Sparse seed index (done)
+3. ✅ Compressed diagonal dedup (done)
+4. ⏳ **Batch many small queries into single kernel launch** (reduce overhead)
+5. ⏳ **Spaced seeds** (DIAMOND's real advantage)
+6. ⏳ **Gapped extension on GPU** (banded SW)
+7. ⏳ **Pinned host memory** for faster H↔D transfers
+8. ⏳ **CUDA Graphs** for repeated launches
+9. ⏳ **Nsight profiling** to find true bottlenecks
+
+---
+
 ## GPU/CPU Execution Split
 
 | Component | GPU | CPU | Notes |
