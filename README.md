@@ -14,6 +14,19 @@ BLOSUM62 scoring and X-dropoff ungapped extension.
 - **Diagonal deduplication**: 256-entry per-thread table avoids redundant extensions
 - **Portable**: Works on any CUDA-capable GPU (Compute Capability 2.0+)
 
+### GPU-Enabled Components
+
+| Component | GPU | CPU | Notes |
+|-----------|-----|-----|-------|
+| **Seed Finding** | ✅ | ✅ | GPU kernel scans 4-mers in parallel |
+| **Ungapped Extension** | ✅ | ✅ | X-drop extension per thread on GPU |
+| **Lookup Table Build** | ❌ | ✅ | Host preprocessing |
+| **SEG Masking** | ❌ | ✅ | Preprocessing on CPU |
+| **K-A Statistics** | ❌ | ✅ | Post-processing on CPU |
+| **Output Formatting** | ❌ | ✅ | I/O on CPU |
+
+All heavy computation (seed matching + extension) runs on GPU. CPU handles I/O and preprocessing.
+
 ## Directory Structure (like real Diamond)
 
 ```
