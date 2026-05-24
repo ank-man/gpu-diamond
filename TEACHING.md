@@ -67,6 +67,21 @@ GPU-Diamond is a CUDA-accelerated implementation of the Diamond protein alignmen
 
 ---
 
+## GPU/CPU Execution Split
+
+| Component | GPU | CPU | Notes |
+|-----------|-----|-----|-------|
+| **Seed Finding** | ✅ | ✅ | GPU kernel scans 4-mers in parallel |
+| **Ungapped Extension** | ✅ | ✅ | X-drop extension per thread on GPU |
+| **Lookup Table Build** | ❌ | ✅ | Host preprocessing (fast on CPU) |
+| **SEG Masking** | ❌ | ✅ | Preprocessing on CPU |
+| **K-A Statistics** | ❌ | ✅ | Post-processing on CPU |
+| **Output Formatting** | ❌ | ✅ | I/O on CPU |
+
+**All heavy computation (seed matching + extension) runs on GPU.** CPU handles I/O and preprocessing only.
+
+---
+
 ## File-by-File Breakdown
 
 ### Core Module: `src/basic/`
