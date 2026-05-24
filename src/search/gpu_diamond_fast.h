@@ -1,10 +1,12 @@
 /****
-GPU-Diamond UltraFast - Optimized CUDA implementation
-- Persistent database (load once, query many)
-- Early termination when MAX_HSPS reached
-- Warp-level collaborative seed finding
-- Score-based HSP priority queue
-- Async streaming for overlap
+GPU-Diamond UltraFast v2 - Production Optimized
+Fixes all correctness and performance issues:
+1. Correct seed_hits/extensions counters
+2. Persistent query lookup buffers in GPUDiamondDB
+3. Sparse seed index transfer (only non-empty buckets)
+4. Real batch search with double buffering
+5. Reduced local memory pressure (compressed diag table)
+6. V100 auto-tuning
 ****/
 
 #ifndef GPU_DIAMOND_FAST_H
@@ -20,20 +22,33 @@ typedef struct {
     int*           d_lens;        /* Device sequence lengths */
     int            num_sequences; /* Total sequences in DB */
     int            padded_len;    /* Padded length per sequence */
-    size_t         db_bytes;      /* Size of d_db */
-    size_t         lens_bytes;    /* Size of d_lens */
+    size_t         db_bytes;
+    size_t         lens_bytes;
     
     /* GPU work buffers (reused across queries) */
-    DiamondResult* d_results;     /* Device results buffer */
-    size_t         results_bytes; /* Size of d_results */
+    DiamondResult* d_results;
+    size_t         results_bytes;
+    
+    /* Persistent query lookup buffers (reused across queries) */
+    uint16_t*      d_sparse_hash;     /* Sparse bucket hashes */
+    uint16_t*      d_sparse_count;    /* Hits per bucket */
+    uint32_t*      d_sparse_offset;   /* Offset into positions */
+    uint32_t*      d_sparse_positions; /* Flat positions array */
+    size_t         max_sparse_buckets;
+    size_t         max_positions;
     
     /* CUDA streams for async execution */
     cudaStream_t   compute_stream;
     cudaStream_t   transfer_stream;
     
+    /* Auto-tuned parameters */
+    int            tuned_num_blocks;
+    int            tuned_num_threads;
+    
     /* Performance stats */
     int            queries_processed;
     float          total_kernel_time;
+    float          total_transfer_time;
 } GPUDiamondDB;
 
 /* Initialize persistent GPU database */
