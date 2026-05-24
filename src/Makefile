@@ -1,4 +1,4 @@
-# Makefile for GPU-Diamond (root Makefile)
+# Makefile for GPU-Diamond
 # CUDA-accelerated seed-and-extend protein alignment
 
 CC      := gcc
@@ -6,17 +6,17 @@ CXX     := g++
 NVCC    ?= nvcc
 
 # Paths
-SRC_DIR  := src
+SRC_DIR  := .
 CUDA_LIB ?= /usr/local/cuda/lib64
 CUDA_INC ?= /usr/local/cuda/include
 
-CFLAGS    := -O2 -Wall -I$(SRC_DIR) -I$(SRC_DIR)/basic -I$(SRC_DIR)/search -I$(SRC_DIR)/align -I$(SRC_DIR)/util
+CFLAGS    := -O2 -Wall -I$(SRC_DIR)/basic -I$(SRC_DIR)/search -I$(SRC_DIR)/align -I$(SRC_DIR)/util
 NVCCFLAGS := -O3 --compiler-options -fno-strict-aliasing -DUNIX -I$(SRC_DIR)/basic
 
-# Source directories (relative to src/)
-BASIC_DIR := $(SRC_DIR)/basic
-SEARCH_DIR := $(SRC_DIR)/search
-TEST_DIR := $(SRC_DIR)/test
+# Source directories
+BASIC_DIR := basic
+SEARCH_DIR := search
+TEST_DIR := test
 
 # Targets
 all: test_gpu_diamond

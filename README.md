@@ -14,15 +14,57 @@ BLOSUM62 scoring and X-dropoff ungapped extension.
 - **Diagonal deduplication**: 256-entry per-thread table avoids redundant extensions
 - **Portable**: Works on any CUDA-capable GPU (Compute Capability 2.0+)
 
-## Files
+## Directory Structure (like real Diamond)
 
-| File | Description |
-|------|-------------|
-| `gpu_diamond.h` | Public API and configuration constants |
-| `gpu_diamond.c` | Host helpers: AA encoding, BLOSUM62 matrix, lookup-table builder |
-| `gpu_diamond.cu` | CUDA kernel + host launcher (`diamond_gpu_search`) |
-| `test_gpu_diamond.c` | Standalone test with 4 sample sequences |
-| `Makefile` | Build rules (no external dependencies required) |
+```
+gpu-diamond/
+├── CMakeLists.txt          # CMake build configuration
+├── Makefile               # Alternative Make build
+├── README.md              # This file
+├── src/
+│   ├── basic/             # Core types and constants
+│   │   ├── gpu_diamond.h   # Public API header
+│   │   └── gpu_diamond.c   # Host helper functions
+│   ├── search/            # Seed finding and hit detection
+│   │   └── gpu_diamond.cu  # CUDA kernel implementation
+│   ├── align/             # Alignment algorithms (future expansion)
+│   ├── util/              # Utility functions (future expansion)
+│   └── test/              # Test suite
+│       └── test_gpu_diamond.c
+└── .gitignore
+```
+
+| Directory | Description |
+|-----------|-------------|
+| `src/basic/` | Core API, types, constants, encoding functions |
+| `src/search/` | CUDA kernels for seed lookup and extension |
+| `src/align/` | Gapped alignment algorithms (future expansion) |
+| `src/util/` | Utility functions (future expansion) |
+| `src/test/` | Test suite |
+
+## Building
+
+### Using CMake (like real Diamond)
+
+```bash
+mkdir build
+cd build
+cmake ..
+make
+```
+
+### Using Make
+
+```bash
+make                    # Build library and test
+make clean              # Clean build artifacts
+```
+
+## Running Tests
+
+```bash
+./test_gpu_diamond
+```
 
 ## Algorithm
 
